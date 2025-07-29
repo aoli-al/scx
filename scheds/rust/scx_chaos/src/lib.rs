@@ -7,6 +7,7 @@ mod bpf_skel;
 pub mod stats;
 
 use bpf_skel::BpfSkel;
+use libbpf_rs::UprobeOpts;
 use stats::Metrics;
 
 use scx_p2dq::SchedulerOpts as P2dqOpts;
@@ -369,6 +370,27 @@ impl Builder<'_> {
         Ok(())
     }
 
+    fn attach_uprobes(&self, skel: &mut BpfSkel) {
+        let uprobe_opts = UprobeOpts {
+            ref_ctr_offset: 0,
+            cookie: 0,
+            retprobe: false,
+            func_name: Some("pthread_mutex_lock".to_string()),
+            ..Default::default()
+        };
+
+        let _lock_link = skel
+            .progs
+            .generic
+            .attach_uprobe_with_opts(
+                -1,
+                "/nix/store/g2jzxk3s7cnkhh8yq55l4fbvf639zy37-glibc-2.40-66/lib/libc.so.6",
+                0,
+                uprobe_opts,
+            )
+            .context("Failed to attach uprobe to pthread_mutex_lock");
+    }
+
     fn attach_kprobes(&self, skel: &mut BpfSkel) -> Result<Vec<Link>> {
         let Some(kd) = &self.kprobe_random_delays else {
             return Ok(vec![]);
@@ -414,7 +436,7 @@ impl Builder<'_> {
         };
 
         let mut skel_builder = bpf_skel::BpfSkelBuilder::default();
-        skel_builder.obj_builder.debug(self.verbose > 1);
+        skel_builder.obj_builder.debug(false);
         init_libbpf_logging(None);
 
         let mut open_skel = scx_ops_open!(skel_builder, open_object, chaos)?;
@@ -552,6 +574,7 @@ impl<'a> TryFrom<Builder<'a>> for Scheduler {
         let (links, struct_ops) = {
             let mut skel_guard = skel.skel.write().unwrap();
             let struct_ops = scx_ops_attach!(skel_guard, chaos)?;
+            b.attach_uprobes(&mut skel_guard);
             let links = b.attach_kprobes(&mut skel_guard)?;
             (links, struct_ops)
         };
@@ -881,6 +904,7 @@ pub fn run(args: Args) -> Result<()> {
             Ok(())
         }
     });
+    info!("Scheduler thread started");
 
     if let Some(pid) = args.pid {
         info!("Monitoring process with PID: {pid}");
@@ -909,6 +933,7 @@ pub fn run(args: Args) -> Result<()> {
     while should_run_app {
         let (cmd, vargs) = args.args.split_first().unwrap();
 
+        info!("Running command: {} {:?}", cmd, vargs);
         let mut child = Command::new(cmd).args(vargs).spawn()?;
         loop {
             should_run_app &= !*shutdown.0.lock().unwrap();

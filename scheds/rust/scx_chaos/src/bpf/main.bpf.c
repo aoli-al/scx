@@ -643,7 +643,8 @@ SCX_OPS_DEFINE(chaos,
 	       .timeout_ms		= 30000,
 	       .name			= "chaos");
 
-SEC("kprobe/generic")
+// SEC("kprobe/generic")
+SEC("uprobe//nix/store/g2jzxk3s7cnkhh8yq55l4fbvf639zy37-glibc-2.40-66/lib/libc.so.6:pthread_mutex_lock")
 int generic(struct pt_regs *ctx)
 {
 	struct task_struct *p;
@@ -656,11 +657,12 @@ int generic(struct pt_regs *ctx)
 	if (!(taskc = lookup_create_chaos_task_ctx(p)))
 		return -EINVAL;
 
-	u32 roll = bpf_get_prandom_u32();
-	if (roll <= kprobe_delays_freq_frac32) {
-		taskc->pending_trait = CHAOS_TRAIT_KPROBE_RANDOM_DELAYS;
-		dbg("GENERIC: setting pending_trait to RANDOM_DELAYS - task[%d]", p->pid);
+	if (taskc->match & CHAOS_MATCH_EXCLUDED) {
+		return 0;
 	}
+
+	taskc->pending_trait = CHAOS_TRAIT_KPROBE_RANDOM_DELAYS;
+	bpf_printk("GENERIC: setting pending_trait to RANDOM_DELAYS - task[%d]", p->pid);
 
 	return 0;
 }

@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     simplelog::TermLogger::init(
-        llv,
+    simplelog::LevelFilter::Info,
         simplelog::ConfigBuilder::new()
             .set_time_offset_to_local()
             .expect("Failed to set local time offset")
