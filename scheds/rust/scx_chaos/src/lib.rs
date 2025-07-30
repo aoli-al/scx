@@ -370,7 +370,7 @@ impl Builder<'_> {
         Ok(())
     }
 
-    fn attach_uprobes(&self, skel: &mut BpfSkel) {
+    fn attach_uprobes(&self, skel: &mut BpfSkel) -> Result<Vec<Link>> {
         let uprobe_opts = UprobeOpts {
             ref_ctr_offset: 0,
             cookie: 0,
@@ -378,40 +378,44 @@ impl Builder<'_> {
             func_name: Some("pthread_mutex_lock".to_string()),
             ..Default::default()
         };
+        let mut links = vec![];
 
-        let _lock_link = skel
+
+        links.push(skel
             .progs
-            .generic
+            .libc_pthread_mutex_lock
             .attach_uprobe_with_opts(
                 -1,
                 "/nix/store/g2jzxk3s7cnkhh8yq55l4fbvf639zy37-glibc-2.40-66/lib/libc.so.6",
                 0,
                 uprobe_opts,
             )
-            .context("Failed to attach uprobe to pthread_mutex_lock");
+            .context("Failed to attach uprobe to pthread_mutex_lock")?,
+        );
+
+        // let uprobe_opts = UprobeOpts {
+        //     ref_ctr_offset: 0,
+        //     cookie: 0,
+        //     retprobe: false,
+        //     func_name: Some("_Z11set_balanceP17bank_account_typei".to_string()),
+        //     ..Default::default()
+        // };
+
+        // let _lock_link = skel
+        //     .progs
+        //     .set_balance
+        //     .attach_uprobe_with_opts(
+        //         -1,
+        //         "/home/aoli/repos/scx/samples/a.out",
+        //         0,
+        //         uprobe_opts,
+        //     )
+        //     .context("Failed to attach uprobe to pthread_mutex_lock");
+        return Ok(links);
     }
 
     fn attach_kprobes(&self, skel: &mut BpfSkel) -> Result<Vec<Link>> {
-        let Some(kd) = &self.kprobe_random_delays else {
-            return Ok(vec![]);
-        };
-
-        if kd.kprobes.is_empty() {
-            return Ok(vec![]);
-        }
-
-        validate_kprobes(&kd.kprobes).context("Failed to validate kprobes passed by user")?;
-
-        let mut links = vec![];
-        for k in &kd.kprobes {
-            links.push(
-                skel.progs
-                    .generic
-                    .attach_kprobe(false, k)
-                    .context(format!("Failed to attach kprobe {k:?}"))?,
-            );
-        }
-        Ok(links)
+        return Ok(vec![]);
     }
 
     fn load_skel(&self) -> Result<Pin<Rc<SkelWithObject>>> {
@@ -539,7 +543,7 @@ impl Builder<'_> {
         // For now, we'll do it in this way. However, once we upgrade to libbpf_rs 0.25.0,
         // we can use the set_autoattach method on the OpenProgramImpl to do this.
         unsafe {
-            bpf_program__set_autoattach(open_skel.progs.generic.as_libbpf_object().as_ptr(), false)
+            bpf_program__set_autoattach(open_skel.progs.libc_pthread_mutex_lock.as_libbpf_object().as_ptr(), false)
         };
 
         let mut skel = scx_ops_load!(open_skel, chaos, uei)?;
@@ -574,8 +578,8 @@ impl<'a> TryFrom<Builder<'a>> for Scheduler {
         let (links, struct_ops) = {
             let mut skel_guard = skel.skel.write().unwrap();
             let struct_ops = scx_ops_attach!(skel_guard, chaos)?;
-            b.attach_uprobes(&mut skel_guard);
-            let links = b.attach_kprobes(&mut skel_guard)?;
+            // b.attach_uprobes(&mut skel_guard);
+            let links = b.attach_uprobes(&mut skel_guard)?;
             (links, struct_ops)
         };
         debug!("scx_chaos scheduler started");
@@ -887,9 +891,13 @@ pub fn run(args: Args) -> Result<()> {
             stats::monitor(Duration::from_secs_f64(intv), shutdown)
         })
     });
+    let scheduler_ready = Arc::new((Mutex::new(false), Condvar::new()));
+
 
     let scheduler_thread = thread::spawn({
         let args = args.clone();
+        let scheduler_ready = scheduler_ready.clone();
+
         let shutdown = shutdown.clone();
 
         move || -> Result<()> {
@@ -898,6 +906,10 @@ pub fn run(args: Args) -> Result<()> {
 
                 let sched: Scheduler = builder.try_into()?;
 
+                let (lock, cvar) = &*scheduler_ready;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+
                 sched.observe(&shutdown, None)?;
             }
 
@@ -905,6 +917,13 @@ pub fn run(args: Args) -> Result<()> {
         }
     });
     info!("Scheduler thread started");
+
+    let sched_ready = scheduler_ready.clone();
+    let (lock, cvar) = &*sched_ready;
+    while !*lock.lock().unwrap() {
+        let _unused = cvar.wait(lock.lock().unwrap()).unwrap();
+    }
+
 
     if let Some(pid) = args.pid {
         info!("Monitoring process with PID: {pid}");

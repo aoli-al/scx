@@ -116,7 +116,7 @@ static __always_inline enum chaos_trait_kind choose_chaos(struct chaos_task_ctx 
 
 static __always_inline bool chaos_trait_skips_select_cpu(struct chaos_task_ctx *taskc)
 {
-	return taskc->next_trait == CHAOS_TRAIT_RANDOM_DELAYS;
+	return taskc->next_trait == CHAOS_TRAIT_RANDOM_DELAYS || taskc->next_trait == CHAOS_TRAIT_KPROBE_RANDOM_DELAYS;
 }
 
 static __always_inline u64 get_cpu_delay_dsq(int cpu_idx)
@@ -190,6 +190,7 @@ static __always_inline s32 calculate_chaos_match(struct task_struct *p)
 		if (p2->pid == ppid_targeting_ppid) {
 			flags |= CHAOS_MATCH_HAS_PARENT;
 			found_parent = pid;
+			bpf_printk("chaos: task[%d, %s] matched", p->pid, p->comm);
 			bpf_task_release(p2);
 			break;
 		}
@@ -248,23 +249,30 @@ static __always_inline s32 calculate_chaos_match(struct task_struct *p)
 		bpf_task_release(p2);
 	}
 
+	if (!(taskc->match & CHAOS_MATCH_EXCLUDED)) {
+		bpf_printk("chaos: task[%d, %s] matched", p->pid, p->comm);
+	}
 out:
 	return ret;
 }
 
-__weak s32 enqueue_random_delay(struct task_struct *p __arg_trusted, u64 enq_flags,
-				struct chaos_task_ctx *taskc __arg_nonnull, u64 min_ns, u64 max_ns)
-{
-	u64 rand64 = ((u64)bpf_get_prandom_u32() << 32) | bpf_get_prandom_u32();
+__weak s32 enqueue_random_delay(struct task_struct *p __arg_trusted,
+                                u64 enq_flags,
+                                struct chaos_task_ctx *taskc __arg_nonnull,
+                                u64 min_ns, u64 max_ns) {
+  u64 rand64 = ((u64)bpf_get_prandom_u32() << 32) | bpf_get_prandom_u32();
 
-	u64 vtime = bpf_ktime_get_ns() + min_ns;
-	if (min_ns != max_ns) {
-		vtime += rand64 % (max_ns - min_ns);
-	}
+  u64 vtime = bpf_ktime_get_ns() + min_ns;
+  if (min_ns != max_ns) {
+    vtime += rand64 % (max_ns - min_ns);
+  }
 
-	scx_bpf_dsq_insert_vtime(p, get_cpu_delay_dsq(-1), 0, vtime, enq_flags);
+  bpf_printk("chaos: task[%d, %s] enqueued new vtime %llu", p->pid, p->comm,
+             vtime);
 
-	return true;
+  scx_bpf_dsq_insert_vtime(p, get_cpu_delay_dsq(-1), 0, vtime, enq_flags);
+
+  return true;
 }
 
 __weak s32 enqueue_chaotic(struct task_struct *p __arg_trusted, u64 enq_flags,
@@ -516,6 +524,11 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	if (promise.kind == P2DQ_ENQUEUE_PROMISE_FAILED)
 		goto cleanup;
 
+	if (taskc->next_trait) {
+		bpf_printk("CHAOS: task[%d, %s] pending trait %d",
+			   p->pid, p->comm, taskc->pending_trait);
+	}
+
 	if ((taskc->next_trait == CHAOS_TRAIT_RANDOM_DELAYS ||
 		taskc->next_trait == CHAOS_TRAIT_KPROBE_RANDOM_DELAYS) &&
 	    enqueue_chaotic(p, enq_flags, taskc))
@@ -552,6 +565,8 @@ void BPF_STRUCT_OPS(chaos_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	if (wakee_ctx->pending_trait) {
+		bpf_printk("CHAOS: task[%d, %s] pending trait %d",
+			   p->pid, p->comm, wakee_ctx->pending_trait);
 		wakee_ctx->next_trait = wakee_ctx->pending_trait;
 		wakee_ctx->pending_trait = 0;
 		return;
@@ -593,8 +608,11 @@ s32 BPF_STRUCT_OPS(chaos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wa
 		goto p2dq;
 
 	// don't allow p2dq to select_cpu if we plan chaos to ensure we hit enqueue
-	if (chaos_trait_skips_select_cpu(wakee_ctx))
+	if (chaos_trait_skips_select_cpu(wakee_ctx)) {
+		bpf_printk("CHAOS: task[%d, %s] skips select_cpu due to trait %d",
+			   p->pid, p->comm, wakee_ctx->next_trait);
 		return prev_cpu;
+	}
 
 p2dq:
 	return p2dq_select_cpu_impl(p, prev_cpu, wake_flags);
@@ -606,8 +624,11 @@ void BPF_STRUCT_OPS(chaos_tick, struct task_struct *p)
 	if (!(taskc = lookup_create_chaos_task_ctx(p)))
 		return;
 
-	if (taskc->pending_trait == CHAOS_TRAIT_KPROBE_RANDOM_DELAYS)
+	if (taskc->next_trait == CHAOS_TRAIT_KPROBE_RANDOM_DELAYS) {
+		bpf_printk("Force yield");
 		p->scx.slice = 0;
+		scx_bpf_kick_cpu(8, SCX_KICK_PREEMPT);
+	}
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(chaos_init_task, struct task_struct *p,
@@ -644,8 +665,7 @@ SCX_OPS_DEFINE(chaos,
 	       .name			= "chaos");
 
 // SEC("kprobe/generic")
-SEC("uprobe//nix/store/g2jzxk3s7cnkhh8yq55l4fbvf639zy37-glibc-2.40-66/lib/libc.so.6:pthread_mutex_lock")
-int generic(struct pt_regs *ctx)
+__always_inline int mutex_lock_handler(struct pt_regs *ctx)
 {
 	struct task_struct *p;
 	struct chaos_task_ctx *taskc;
@@ -658,11 +678,34 @@ int generic(struct pt_regs *ctx)
 		return -EINVAL;
 
 	if (taskc->match & CHAOS_MATCH_EXCLUDED) {
-		return 0;
+		// bpf_printk("pthread_mutex_excluded[%d, %s]", p->pid, p->comm);
+		return 1;
 	}
 
-	taskc->pending_trait = CHAOS_TRAIT_KPROBE_RANDOM_DELAYS;
-	bpf_printk("GENERIC: setting pending_trait to RANDOM_DELAYS - task[%d]", p->pid);
+	taskc->next_trait = CHAOS_TRAIT_KPROBE_RANDOM_DELAYS;
+	bpf_printk("pthread_mutex_lock[%d, %s]", p->pid, p->comm);
 
 	return 0;
 }
+
+
+SEC("uprobe//nix/store/g2jzxk3s7cnkhh8yq55l4fbvf639zy37-glibc-2.40-66/lib/libc.so.6:pthread_mutex_lock")
+int libc_pthread_mutex_lock(struct pt_regs *ctx)
+{
+	return mutex_lock_handler(ctx);
+}
+
+
+SEC("uprobe//home/aoli/repos/scx/samples/a.out:_Z11set_balanceP17bank_account_typei")
+int set_balance(struct pt_regs *ctx)
+{
+	return 0;
+	// return mutex_lock_handler(ctx);
+}
+
+
+// SEC("uprobe//nix/store/6vzcxjxa2wlh3p9f5nhbk62bl3q313ri-gcc-14.3.0-lib/lib/libgcc_s.so.1:pthread_mutex_lock")
+// int libgcc_pthread_mutex_lock(struct pt_regs *ctx)
+// {
+// 	return mutex_lock_handler(ctx);
+// }
